@@ -54,6 +54,7 @@ import android.internal.perfetto.protos.Windowmanagerservice.KeyguardPerDisplayP
 import android.os.IBinder;
 import android.os.RemoteException;
 import android.os.SystemClock;
+import android.os.SystemProperties;
 import android.os.Trace;
 import android.util.Slog;
 import android.util.SparseArray;
@@ -242,6 +243,8 @@ class KeyguardController {
         state.writeEventLog("setKeyguardShown");
 
         if (displayId == DEFAULT_DISPLAY && keyguardChanged) {
+            SystemProperties.set("debug.tracing.keyguard_state",
+                    keyguardShowing ? "1" : "0");
             final GameSpaceService gameSpaceService =
                     LocalServices.getService(GameSpaceService.class);
             if (gameSpaceService != null) {

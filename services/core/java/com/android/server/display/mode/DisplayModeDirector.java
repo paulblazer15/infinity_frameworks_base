@@ -121,6 +121,16 @@ import com.infinity.display.RefreshRateManager;
  */
 public class DisplayModeDirector {
 
+    private static final String FORCE_PEAK_REFRESH_RATE_PROPERTY =
+            "debug.tracing.force_peak_refresh_rate";
+    private static final String LTPO_MIN_REFRESH_RATE_PROPERTY =
+            "debug.tracing.ltpo_min_refresh_rate";
+    private static final String LTPO_PEAK_REFRESH_RATE_PROPERTY =
+            "debug.tracing.ltpo_peak_refresh_rate";
+    private static final boolean USE_LTPO_BASE_REFRESH_RATE = SystemProperties.getBoolean(
+            "ro.vendor.display.ltpo.supported", false) && !SystemProperties.get(
+            "ro.surface_flinger.panel_refresh_rate_property", "").isEmpty();
+
     public static final float SYNCHRONIZED_REFRESH_RATE_TARGET = DEFAULT_LOW_REFRESH_RATE;
     public static final float SYNCHRONIZED_REFRESH_RATE_TOLERANCE = 1;
     private static final String TAG = "DisplayModeDirector";
@@ -156,6 +166,12 @@ public class DisplayModeDirector {
     private final RefreshRateObserver mRefreshRateObserver;
     private final DeviceConfigParameterProvider mConfigParameterProvider;
     private final DeviceConfigDisplaySettings mDeviceConfigDisplaySettings;
+
+    @GuardedBy("mLock")
+    private int mRequestedRefreshRate = -1;
+
+    @GuardedBy("mLock")
+    private boolean mUseFrameworkIdleTimer;
 
     @GuardedBy("mLock")
     @Nullable
@@ -391,7 +407,7 @@ public class DisplayModeDirector {
                 final RefreshRateRanges ranges = new RefreshRateRanges(range, range);
                 return new DesiredDisplayModeSpecs(defaultMode.getModeId(),
                         /*allowGroupSwitching */ false,
-                        ranges, ranges, mBrightnessObserver.getIdleScreenRefreshRateConfig(), null);
+                        ranges, ranges, getIdleScreenRefreshRateConfigLocked(displayId), null);
             }
 
             boolean modeSwitchingDisabled =
@@ -450,9 +466,18 @@ public class DisplayModeDirector {
                             new RefreshRateRange(
                                     appRequestSummary.minRenderFrameRate,
                                     appRequestSummary.maxRenderFrameRate)),
-                    mBrightnessObserver.getIdleScreenRefreshRateConfig(),
+                    getIdleScreenRefreshRateConfigLocked(displayId),
                     primarySummary.workDurationsData);
         }
+    }
+
+    @GuardedBy("mLock")
+    private IdleScreenRefreshRateConfig getIdleScreenRefreshRateConfigLocked(int displayId) {
+        if (USE_LTPO_BASE_REFRESH_RATE && displayId == Display.DEFAULT_DISPLAY) {
+            // An explicit zero pauses the timer when panel-side LTPO owns idle transitions.
+            return new IdleScreenRefreshRateConfig(mUseFrameworkIdleTimer ? 1500 : 0);
+        }
+        return mBrightnessObserver.getIdleScreenRefreshRateConfig();
     }
 
     /**
@@ -1273,6 +1298,12 @@ public class DisplayModeDirector {
                 peakRefreshRate = highestRefreshRate;
             }
 
+            if (USE_LTPO_BASE_REFRESH_RATE && displayId == Display.DEFAULT_DISPLAY
+                    && mRequestedRefreshRate > 0) {
+                minRefreshRate = mRequestedRefreshRate;
+                peakRefreshRate = mRequestedRefreshRate;
+            }
+
             updateRefreshRateSettingLocked(minRefreshRate, peakRefreshRate, mDefaultRefreshRate,
                     displayId);
         }
@@ -1291,7 +1322,45 @@ public class DisplayModeDirector {
             // used to predict if we're going to be doing frequent refresh rate switching, and if
             // so, enable the brightness observer. The logic here is more complicated and fragile
             // than necessary, and we should improve it. See b/156304339 for more info.
-            if (!isVrrSupportedLocked(displayId)) {
+            final float highestRefreshRate = getMaxRefreshRateLocked(displayId);
+            if (USE_LTPO_BASE_REFRESH_RATE && displayId == Display.DEFAULT_DISPLAY) {
+                final boolean useFrameworkIdleTimer = !mDisplayObserver.isDozingLocked(displayId)
+                        && (peakRefreshRate < highestRefreshRate - 0.01f
+                                || minRefreshRate > 60.01f);
+                if (mUseFrameworkIdleTimer != useFrameworkIdleTimer) {
+                    mUseFrameworkIdleTimer = useFrameworkIdleTimer;
+                    notifyDesiredDisplayModeSpecsChangedLocked();
+                }
+                final boolean forcePeakRefreshRate = highestRefreshRate > 0f
+                        && minRefreshRate >= highestRefreshRate - 0.01f;
+                SystemProperties.set(FORCE_PEAK_REFRESH_RATE_PROPERTY,
+                        forcePeakRefreshRate ? "1" : "0");
+                SystemProperties.set(LTPO_MIN_REFRESH_RATE_PROPERTY,
+                        Integer.toString(Math.round(minRefreshRate)));
+                SystemProperties.set(LTPO_PEAK_REFRESH_RATE_PROPERTY,
+                        Integer.toString(Math.round(peakRefreshRate)));
+            }
+
+            if (USE_LTPO_BASE_REFRESH_RATE && displayId == Display.DEFAULT_DISPLAY) {
+                Vote peakVote = null;
+                if (peakRefreshRate != 0f) {
+                    final boolean useLtpoBase = mDisplayObserver.isDozingLocked(displayId)
+                            || (highestRefreshRate > 0f
+                                    && peakRefreshRate >= highestRefreshRate - 0.01f
+                                    && minRefreshRate <= 60.01f
+                                    && minRefreshRate < peakRefreshRate);
+                    if (useLtpoBase) {
+                        // Pong accepts skip-frame commands only in its highest base mode.
+                        peakVote = Vote.forPhysicalRefreshRates(
+                                highestRefreshRate, highestRefreshRate);
+                    } else {
+                        peakVote = Vote.forPhysicalRefreshRates(0f,
+                                Math.max(minRefreshRate, peakRefreshRate));
+                    }
+                }
+                mVotesStorage.updateVote(displayId, Vote.PRIORITY_USER_SETTING_PEAK_REFRESH_RATE,
+                        peakVote);
+            } else if (!isVrrSupportedLocked(displayId)) {
                 Vote peakVote = peakRefreshRate == 0f
                         ? null
                         : Vote.forPhysicalRefreshRates(0f,
@@ -1489,6 +1558,8 @@ public class DisplayModeDirector {
         private int mExternalDisplayPeakRefreshRate;
         private final boolean mRefreshRateSynchronizationEnabled;
         private int mDefaultDisplayType = Display.TYPE_INTERNAL;
+        @GuardedBy("mLock")
+        private int mDefaultDisplayState = Display.STATE_UNKNOWN;
 
         private final ModeRequestManager mModeRequestManager;
 
@@ -1813,7 +1884,14 @@ public class DisplayModeDirector {
                 return;
             }
             boolean changed = false;
+            boolean dozeStateChanged = false;
             synchronized (mLock) {
+                if (displayId == Display.DEFAULT_DISPLAY
+                        && info.state != mDefaultDisplayState) {
+                    dozeStateChanged = Display.isDozeState(info.state)
+                            != Display.isDozeState(mDefaultDisplayState);
+                    mDefaultDisplayState = info.state;
+                }
                 if (!Arrays.equals(mSupportedModesByDisplay.get(displayId), info.supportedModes)) {
                     mSupportedModesByDisplay.put(displayId, info.supportedModes);
                     changed = true;
@@ -1822,11 +1900,17 @@ public class DisplayModeDirector {
                     changed = true;
                     mDefaultModeByDisplay.put(displayId, info.getDefaultMode());
                 }
-                if (changed) {
+                if (changed || (USE_LTPO_BASE_REFRESH_RATE && dozeStateChanged)) {
                     notifyDesiredDisplayModeSpecsChangedLocked();
                     mSettingsObserver.updateRefreshRateSettingLocked(displayId);
                 }
             }
+        }
+
+        @GuardedBy("mLock")
+        private boolean isDozingLocked(int displayId) {
+            return displayId == Display.DEFAULT_DISPLAY
+                    && Display.isDozeState(mDefaultDisplayState);
         }
 
         private void updateHasArrSupport(int displayId, @Nullable DisplayInfo info) {
@@ -3145,6 +3229,12 @@ public class DisplayModeDirector {
                 vote = null;
             }
             mVotesStorage.updateGlobalVote(Vote.PRIORITY_USER_PREFERRED, vote);
+            if (USE_LTPO_BASE_REFRESH_RATE) {
+                synchronized (mLock) {
+                    mRequestedRefreshRate = refreshRate;
+                    mSettingsObserver.updateRefreshRateSettingLocked();
+                }
+            }
         }
 
         @Override
